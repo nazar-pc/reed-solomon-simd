@@ -39,7 +39,7 @@ pub use self::{
     engine_default::DefaultEngine,
     engine_naive::Naive,
     engine_nosimd::NoSimd,
-    shards::{ShardStorage, ShardsRefMut},
+    shards::{BorrowedShardStorage, ShardStorage, ShardsRefMut},
 };
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

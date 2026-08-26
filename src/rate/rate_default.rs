@@ -1,16 +1,37 @@
-use core::{cmp::Ordering, marker::PhantomData};
+use core::marker::PhantomData;
 
 use crate::{
     engine::{Engine, GF_ORDER},
     rate::{
-        DecoderWork, EncoderWork, HighRateDecoder, HighRateEncoder, LowRateDecoder, LowRateEncoder,
-        Rate, RateDecoder, RateEncoder,
+        DecoderWork, EncoderWork, HighRateDecoder, HighRateEncoder, InPlaceWork, LowRateDecoder,
+        LowRateEncoder, Rate, RateDecoder, RateEncoder, ReceivedShards,
     },
     DecoderResult, EncoderResult, Error,
 };
 
 // ======================================================================
 // FUNCTIONS - PRIVATE
+
+/// Rate choice for a combination that is already known to be supported.
+const fn use_high_rate_unchecked(original_count: usize, recovery_count: usize) -> bool {
+    let original_count_pow2 = original_count.next_power_of_two();
+    let recovery_count_pow2 = recovery_count.next_power_of_two();
+
+    if original_count_pow2 < recovery_count_pow2 {
+        // The "correct" rate is generally faster here,
+        // and also must be used if `recovery_count > 32768`.
+        false
+    } else if original_count_pow2 > recovery_count_pow2 {
+        // The "correct" rate is generally faster here,
+        // and also must be used if `original_count > 32768`.
+        true
+    } else {
+        // Here counter-intuitively the "wrong" rate is generally faster
+        // in decoding if `original_count` and `recovery_count` differ a lot,
+        // so the "wrong" rate is used on purpose.
+        original_count <= recovery_count
+    }
+}
 
 fn use_high_rate(original_count: usize, recovery_count: usize) -> Result<bool, Error> {
     if original_count > GF_ORDER || recovery_count > GF_ORDER {
@@ -33,34 +54,7 @@ fn use_high_rate(original_count: usize, recovery_count: usize) -> Result<bool, E
         });
     }
 
-    match original_count_pow2.cmp(&recovery_count_pow2) {
-        Ordering::Less => {
-            // The "correct" rate is generally faster here,
-            // and also must be used if `recovery_count > 32768`.
-
-            Ok(false)
-        }
-
-        Ordering::Greater => {
-            // The "correct" rate is generally faster here,
-            // and also must be used if `original_count > 32768`.
-
-            Ok(true)
-        }
-
-        Ordering::Equal => {
-            // Here counter-intuitively the "wrong" rate is generally faster
-            // in decoding if `original_count` and `recovery_count` differ a lot.
-
-            if original_count <= recovery_count {
-                // Using the "wrong" rate on purpose.
-                Ok(true)
-            } else {
-                // Using the "wrong" rate on purpose.
-                Ok(false)
-            }
-        }
-    }
+    Ok(use_high_rate_unchecked(original_count, recovery_count))
 }
 
 // ======================================================================
@@ -217,6 +211,166 @@ enum InnerDecoder<E: Engine> {
     // This is only used temporarily during `reset`, never anywhere else.
     #[default]
     None,
+}
+
+// ======================================================================
+// DefaultRateEncoder - IN-PLACE - PUBLIC
+
+impl<E: Engine> DefaultRateEncoder<E> {
+    /// Size in bytes of the working buffer required by [`DefaultRateEncoder::encode_in_place`].
+    ///
+    /// See [`HighRateEncoder::in_place_work_bytes`] for details.
+    #[must_use]
+    pub const fn in_place_work_bytes(
+        original_count: usize,
+        recovery_count: usize,
+        shard_bytes: usize,
+    ) -> usize {
+        if use_high_rate_unchecked(original_count, recovery_count) {
+            HighRateEncoder::<E>::in_place_work_bytes(original_count, recovery_count, shard_bytes)
+        } else {
+            LowRateEncoder::<E>::in_place_work_bytes(original_count, recovery_count, shard_bytes)
+        }
+    }
+
+    /// Encodes in a caller-provided working buffer, without allocating anything, using high or low
+    /// rate as appropriate.
+    ///
+    /// See [`HighRateEncoder::encode_in_place`] for details. The working buffer must be
+    /// [`DefaultRateEncoder::in_place_work_bytes`] long.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidWorkBufferSize`] if `work` is smaller than
+    /// [`DefaultRateEncoder::in_place_work_bytes`], otherwise same as [`RateEncoder::validate`].
+    pub fn encode_in_place<W: InPlaceWork + ?Sized>(
+        engine: &E,
+        original_count: usize,
+        recovery_count: usize,
+        shard_bytes: usize,
+        work: &mut W,
+    ) -> Result<(), Error> {
+        if use_high_rate(original_count, recovery_count)? {
+            HighRateEncoder::encode_in_place(
+                engine,
+                original_count,
+                recovery_count,
+                shard_bytes,
+                work,
+            )
+        } else {
+            LowRateEncoder::encode_in_place(
+                engine,
+                original_count,
+                recovery_count,
+                shard_bytes,
+                work,
+            )
+        }
+    }
+}
+
+// ======================================================================
+// DefaultRateDecoder - IN-PLACE - PUBLIC
+
+impl<E: Engine> DefaultRateDecoder<E> {
+    /// Size in bytes of the working buffer required by [`DefaultRateDecoder::decode_in_place`].
+    ///
+    /// See [`HighRateDecoder::in_place_work_bytes`] for details.
+    #[must_use]
+    pub const fn in_place_work_bytes(
+        original_count: usize,
+        recovery_count: usize,
+        shard_bytes: usize,
+    ) -> usize {
+        if use_high_rate_unchecked(original_count, recovery_count) {
+            HighRateDecoder::<E>::in_place_work_bytes(original_count, recovery_count, shard_bytes)
+        } else {
+            LowRateDecoder::<E>::in_place_work_bytes(original_count, recovery_count, shard_bytes)
+        }
+    }
+
+    /// Working buffer slot of original shard `index` for [`DefaultRateDecoder::decode_in_place`].
+    ///
+    /// Pass the returned slot to [`write_in_place_shard`] and [`read_in_place_shard`].
+    ///
+    /// [`write_in_place_shard`]: crate::rate::write_in_place_shard
+    /// [`read_in_place_shard`]: crate::rate::read_in_place_shard
+    #[must_use]
+    pub const fn in_place_original_slot(
+        original_count: usize,
+        recovery_count: usize,
+        index: usize,
+    ) -> usize {
+        if use_high_rate_unchecked(original_count, recovery_count) {
+            HighRateDecoder::<E>::in_place_original_slot(original_count, recovery_count, index)
+        } else {
+            LowRateDecoder::<E>::in_place_original_slot(original_count, recovery_count, index)
+        }
+    }
+
+    /// Working buffer slot of recovery shard `index` for [`DefaultRateDecoder::decode_in_place`].
+    ///
+    /// Pass the returned slot to [`write_in_place_shard`].
+    ///
+    /// [`write_in_place_shard`]: crate::rate::write_in_place_shard
+    #[must_use]
+    pub const fn in_place_recovery_slot(
+        original_count: usize,
+        recovery_count: usize,
+        index: usize,
+    ) -> usize {
+        if use_high_rate_unchecked(original_count, recovery_count) {
+            HighRateDecoder::<E>::in_place_recovery_slot(original_count, recovery_count, index)
+        } else {
+            LowRateDecoder::<E>::in_place_recovery_slot(original_count, recovery_count, index)
+        }
+    }
+
+    /// Decodes in a caller-provided working buffer, without allocating anything, using high or low
+    /// rate as appropriate.
+    ///
+    /// See [`HighRateDecoder::decode_in_place`] for details. The working buffer must be
+    /// [`DefaultRateDecoder::in_place_work_bytes`] long and shard slots must be obtained with
+    /// [`DefaultRateDecoder::in_place_original_slot`] and
+    /// [`DefaultRateDecoder::in_place_recovery_slot`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotEnoughShards`] if fewer shards than `original_count` were received and
+    /// [`Error::InvalidWorkBufferSize`] if `work` is smaller than
+    /// [`DefaultRateDecoder::in_place_work_bytes`], otherwise same as [`RateDecoder::validate`].
+    pub fn decode_in_place<W: InPlaceWork + ?Sized>(
+        engine: &E,
+        original_count: usize,
+        recovery_count: usize,
+        original_received: impl ReceivedShards,
+        recovery_received: impl ReceivedShards,
+        shard_bytes: usize,
+        work: &mut W,
+    ) -> Result<(), Error> {
+        if use_high_rate(original_count, recovery_count)? {
+            HighRateDecoder::decode_in_place(
+                engine,
+                original_count,
+                recovery_count,
+                original_received,
+                recovery_received,
+                shard_bytes,
+                work,
+            )
+        } else {
+            LowRateDecoder::decode_in_place(
+                engine,
+                original_count,
+                recovery_count,
+                original_received,
+                recovery_received,
+                shard_bytes,
+                work,
+            )
+        }
+    }
 }
 
 // ======================================================================

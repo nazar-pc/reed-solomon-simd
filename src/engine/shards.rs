@@ -379,6 +379,91 @@ impl IndexMut<usize> for ShardsRefMut<'_> {
     }
 }
 
+// ======================================================================
+// BorrowedShardStorage - PUBLIC
+
+/// [`ShardStorage`] which forwards to a mutably borrowed [`ShardStorage`].
+///
+/// `&mut S` can't implement [`ShardStorage`] itself, because [`Index`] and
+/// [`IndexMut`] are not implemented for references. This wrapper exists so that
+/// a storage can still be handed to the algorithms without giving up ownership
+/// of it.
+pub struct BorrowedShardStorage<'a, S: ?Sized>(&'a mut S);
+
+impl<'a, S: ShardStorage + ?Sized> BorrowedShardStorage<'a, S> {
+    /// Wraps a mutable reference to `storage`.
+    pub fn new(storage: &'a mut S) -> Self {
+        Self(storage)
+    }
+}
+
+// ======================================================================
+// BorrowedShardStorage - IMPL Index
+
+impl<S: ShardStorage + ?Sized> Index<usize> for BorrowedShardStorage<'_, S> {
+    type Output = [[u8; 64]];
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
+// ======================================================================
+// BorrowedShardStorage - IMPL IndexMut
+
+impl<S: ShardStorage + ?Sized> IndexMut<usize> for BorrowedShardStorage<'_, S> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.0[index]
+    }
+}
+
+// ======================================================================
+// BorrowedShardStorage - IMPL ShardStorage
+
+// SAFETY: Every method forwards to the borrowed storage, which upholds the
+// guarantees of `ShardStorage` itself.
+unsafe impl<S: ShardStorage + ?Sized> ShardStorage for BorrowedShardStorage<'_, S> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    unsafe fn dist2_mut(&mut self, pos: usize, dist: usize) -> (&mut [[u8; 64]], &mut [[u8; 64]]) {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { self.0.dist2_mut(pos, dist) }
+    }
+
+    unsafe fn dist4_mut(
+        &mut self,
+        pos: usize,
+        dist: usize,
+    ) -> (
+        &mut [[u8; 64]],
+        &mut [[u8; 64]],
+        &mut [[u8; 64]],
+        &mut [[u8; 64]],
+    ) {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { self.0.dist4_mut(pos, dist) }
+    }
+
+    fn zero(&mut self, range: impl RangeBounds<usize>) {
+        self.0.zero(range);
+    }
+
+    unsafe fn xor_within(&mut self, x: usize, y: usize, count: usize) {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { self.0.xor_within(x, y, count) };
+    }
+
+    unsafe fn copy_within(&mut self, src: usize, dest: usize, count: usize) {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { self.0.copy_within(src, dest, count) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::engine::{self, Engine, NoSimd, ShardStorage, ShardsRefMut};

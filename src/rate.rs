@@ -33,7 +33,12 @@
 //! [`ReedSolomonDecoder`]: crate::ReedSolomonDecoder
 //! [`DefaultEngine`]: crate::engine::DefaultEngine
 
-use crate::{engine::Engine, DecoderResult, EncoderResult, Error};
+use crate::{
+    engine::{BorrowedShardStorage, Engine, ShardStorage, ShardsRefMut},
+    DecoderResult, EncoderResult, Error,
+};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use core::ops::Range;
 use fixedbitset::FixedBitSet;
 
@@ -385,6 +390,335 @@ impl<T: AsRef<[u64]>> ReceivedShards for ReceivedShardBits<T> {
 }
 
 // ======================================================================
+// IN-PLACE ENCODING - PUBLIC
+
+/// Number of bytes a single shard occupies in an in-place working buffer.
+///
+/// This is `shard_bytes` rounded up to a multiple of 64, because encoding operates on 64 byte
+/// chunks. Shard with index `n` occupies bytes `n * stride .. n * stride + shard_bytes` of the
+/// working buffer (see [`write_in_place_shard`] for the one case where this is not the whole
+/// story).
+///
+/// See [`HighRateEncoder::encode_in_place`] for details about in-place encoding.
+///
+/// [`HighRateEncoder::encode_in_place`]: crate::rate::HighRateEncoder::encode_in_place
+#[must_use]
+pub const fn in_place_shard_stride(shard_bytes: usize) -> usize {
+    shard_bytes.next_multiple_of(64)
+}
+
+/// Writes an original `shard` into the in-place working buffer at `index`.
+///
+/// When `shard_bytes` is a multiple of 64 this is a plain copy into
+/// `work[index * stride..][..shard_bytes]` and can just as well be done by the caller (or avoided
+/// entirely by producing the shard in the working buffer in the first place). Otherwise the last,
+/// partial 64 byte chunk of the shard needs a special layout, which this function takes care of.
+///
+/// See [`HighRateEncoder::encode_in_place`] for details about in-place encoding.
+///
+/// # Errors
+///
+/// Returns [`Error::DifferentShardSize`] if `shard.len() != shard_bytes` and
+/// [`Error::InvalidWorkBufferSize`] if `work` is too small to contain shard `index`.
+///
+/// [`HighRateEncoder::encode_in_place`]: crate::rate::HighRateEncoder::encode_in_place
+pub fn write_in_place_shard(
+    work: &mut [u8],
+    shard_bytes: usize,
+    index: usize,
+    shard: &[u8],
+) -> Result<(), Error> {
+    if shard.len() != shard_bytes {
+        return Err(Error::DifferentShardSize {
+            shard_bytes,
+            got: shard.len(),
+        });
+    }
+
+    let stride = in_place_shard_stride(shard_bytes);
+    let required = (index + 1) * stride;
+    if work.len() < required {
+        return Err(Error::InvalidWorkBufferSize {
+            required,
+            got: work.len(),
+        });
+    }
+
+    let dst = &mut work[index * stride..][..stride];
+    let tail_len = shard_bytes % 64;
+    let whole_chunks_len = shard_bytes - tail_len;
+
+    let (src_chunks, src_tail) = shard.split_at(whole_chunks_len);
+    dst[..whole_chunks_len].copy_from_slice(src_chunks);
+
+    // Last chunk is special if `shard_bytes % 64 != 0`.
+    // See `src/algorithm.md` for an explanation.
+    if tail_len > 0 {
+        let (src_lo, src_hi) = src_tail.split_at(tail_len / 2);
+        let (dst_lo, dst_hi) = dst[whole_chunks_len..].split_at_mut(32);
+        dst_lo[..src_lo.len()].copy_from_slice(src_lo);
+        dst_hi[..src_hi.len()].copy_from_slice(src_hi);
+    }
+
+    Ok(())
+}
+
+/// Returns the recovery shard with the given `index` from an in-place working buffer that was
+/// encoded with `shard_bytes` sized shards.
+///
+/// This is simply `&work[index * stride..][..shard_bytes]`, provided as a helper for readability.
+///
+/// See [`HighRateEncoder::encode_in_place`] for details about in-place encoding.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidWorkBufferSize`] if `work` is too small to contain shard `index`.
+///
+/// [`HighRateEncoder::encode_in_place`]: crate::rate::HighRateEncoder::encode_in_place
+pub fn read_in_place_shard(work: &[u8], shard_bytes: usize, index: usize) -> Result<&[u8], Error> {
+    let stride = in_place_shard_stride(shard_bytes);
+    let required = (index + 1) * stride;
+    if work.len() < required {
+        return Err(Error::InvalidWorkBufferSize {
+            required,
+            got: work.len(),
+        });
+    }
+
+    Ok(&work[index * stride..][..shard_bytes])
+}
+
+// ======================================================================
+// InPlaceWork - PUBLIC
+
+/// Working buffer of the in-place encoding and decoding APIs.
+///
+/// This is implemented for byte buffers (`[u8]`, `[u8; N]` and `Vec<u8>`), which hold the shards
+/// in the flat layout described by [`in_place_shard_stride`], and for every [`ShardStorage`],
+/// which lets the caller keep the shards wherever they want to.
+///
+/// [`ShardStorage`]: crate::engine::ShardStorage
+pub trait InPlaceWork {
+    /// Shard storage that the encoding/decoding algorithms operate on.
+    type Storage<'a>: ShardStorage
+    where
+        Self: 'a;
+
+    /// Borrows this working buffer as storage of `work_count` shards of `shard_bytes` bytes each.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidWorkBufferSize`] if this working buffer is too small.
+    fn in_place_storage(
+        &mut self,
+        work_count: usize,
+        shard_bytes: usize,
+    ) -> Result<Self::Storage<'_>, Error>;
+}
+
+impl InPlaceWork for [u8] {
+    type Storage<'a> = ShardsRefMut<'a>;
+
+    fn in_place_storage(
+        &mut self,
+        work_count: usize,
+        shard_bytes: usize,
+    ) -> Result<ShardsRefMut<'_>, Error> {
+        in_place_work(self, work_count, shard_bytes)
+    }
+}
+
+impl<const N: usize> InPlaceWork for [u8; N] {
+    type Storage<'a> = ShardsRefMut<'a>;
+
+    fn in_place_storage(
+        &mut self,
+        work_count: usize,
+        shard_bytes: usize,
+    ) -> Result<ShardsRefMut<'_>, Error> {
+        in_place_work(self, work_count, shard_bytes)
+    }
+}
+
+impl InPlaceWork for Vec<u8> {
+    type Storage<'a> = ShardsRefMut<'a>;
+
+    fn in_place_storage(
+        &mut self,
+        work_count: usize,
+        shard_bytes: usize,
+    ) -> Result<ShardsRefMut<'_>, Error> {
+        in_place_work(self, work_count, shard_bytes)
+    }
+}
+
+impl<S: ShardStorage> InPlaceWork for S {
+    type Storage<'a>
+        = BorrowedShardStorage<'a, S>
+    where
+        S: 'a;
+
+    fn in_place_storage(
+        &mut self,
+        work_count: usize,
+        shard_bytes: usize,
+    ) -> Result<BorrowedShardStorage<'_, S>, Error> {
+        if self.len() < work_count {
+            let stride = in_place_shard_stride(shard_bytes);
+            return Err(Error::InvalidWorkBufferSize {
+                required: work_count * stride,
+                got: self.len() * stride,
+            });
+        }
+
+        Ok(BorrowedShardStorage::new(self))
+    }
+}
+
+// ======================================================================
+// IN-PLACE ENCODING - CRATE
+
+/// Validates the common in-place encoding preconditions and turns `work` into [`ShardsRefMut`].
+pub(crate) fn in_place_work(
+    work: &mut [u8],
+    work_count: usize,
+    shard_bytes: usize,
+) -> Result<ShardsRefMut<'_>, Error> {
+    let stride = in_place_shard_stride(shard_bytes);
+    let required = work_count * stride;
+    if work.len() < required {
+        return Err(Error::InvalidWorkBufferSize {
+            required,
+            got: work.len(),
+        });
+    }
+
+    let work = &mut work[..required];
+    // SAFETY: `[u8; 64]` has the same alignment as `u8` and `work.len()` is a multiple of 64
+    let chunks = unsafe {
+        core::slice::from_raw_parts_mut(work.as_mut_ptr().cast::<[u8; 64]>(), work.len() / 64)
+    };
+
+    Ok(ShardsRefMut::new(work_count, stride / 64, chunks))
+}
+
+/// Undoes the encoding of the last, partial 64 byte chunk of the given shards, so that they can be
+/// read out of the working buffer directly.
+pub(crate) fn undo_in_place_last_chunk_encoding<S: ShardStorage>(
+    work: &mut S,
+    shard_bytes: usize,
+    range: Range<usize>,
+) {
+    let tail_len = shard_bytes % 64;
+
+    if tail_len == 0 {
+        return;
+    }
+
+    let whole_chunk_count = shard_bytes / 64;
+    for index in range {
+        let last_chunk = &mut work[index][whole_chunk_count];
+        last_chunk.copy_within(32..32 + tail_len / 2, tail_len / 2);
+    }
+}
+
+/// [`ReceivedShards`] over a decoder working buffer, backed by separate original/recovery
+/// flags at known base positions.
+///
+/// The original and recovery ranges must not overlap.
+pub(crate) struct ReceivedShardFlags<O, R> {
+    pub(crate) original: O,
+    pub(crate) original_base_pos: usize,
+    pub(crate) original_count: usize,
+    pub(crate) recovery: R,
+    pub(crate) recovery_base_pos: usize,
+    pub(crate) recovery_count: usize,
+}
+
+impl<O: ReceivedShards, R: ReceivedShards> ReceivedShards for ReceivedShardFlags<O, R> {
+    #[inline]
+    fn received_word(&self, word_index: usize) -> u64 {
+        let Some(word_start) = word_index.checked_mul(64) else {
+            return 0;
+        };
+
+        shifted_word(
+            &self.original,
+            self.original_base_pos,
+            self.original_count,
+            word_start,
+        ) | shifted_word(
+            &self.recovery,
+            self.recovery_base_pos,
+            self.recovery_count,
+            word_start,
+        )
+    }
+
+    #[inline(always)]
+    fn received(&self, pos: usize) -> bool {
+        if pos >= self.original_base_pos && pos < self.original_base_pos + self.original_count {
+            return self.original.received(pos - self.original_base_pos);
+        }
+        if pos >= self.recovery_base_pos && pos < self.recovery_base_pos + self.recovery_count {
+            return self.recovery.received(pos - self.recovery_base_pos);
+        }
+        false
+    }
+}
+
+/// Returns the received flags of shards `word_start .. word_start + 64` which are backed by
+/// `source`, whose shard `0` is at position `base_pos` and which covers `count` shards.
+#[inline]
+fn shifted_word(
+    source: &impl ReceivedShards,
+    base_pos: usize,
+    count: usize,
+    word_start: usize,
+) -> u64 {
+    // Positions covered by both this word and the source.
+    let lo = core::cmp::max(word_start, base_pos);
+    let hi = core::cmp::min(word_start.saturating_add(64), base_pos + count);
+    if lo >= hi {
+        return 0;
+    }
+
+    // Corresponding indices within the source, which span at most two of its words.
+    let first = lo - base_pos;
+    let len = hi - lo;
+    let offset = first % 64;
+
+    let mut bits = source.received_word(first / 64) >> offset;
+    if offset > 0 && offset + len > 64 {
+        bits |= source.received_word(first / 64 + 1) << (64 - offset);
+    }
+
+    (bits & low_bits(len)) << (lo - word_start)
+}
+
+/// Checks that enough shards were received for decoding to be possible and returns `false` if
+/// there is nothing to decode because all original shards are already present.
+pub(crate) fn decode_in_place_begin(
+    original_count: usize,
+    recovery_count: usize,
+    original_received: &impl ReceivedShards,
+    recovery_received: &impl ReceivedShards,
+) -> Result<bool, Error> {
+    let original_received_count = original_received.received_count(0..original_count);
+    let recovery_received_count = recovery_received.received_count(0..recovery_count);
+
+    if original_received_count + recovery_received_count < original_count {
+        Err(Error::NotEnoughShards {
+            original_count,
+            original_received_count,
+            recovery_received_count,
+        })
+    } else {
+        Ok(original_received_count != original_count)
+    }
+}
+
+// ======================================================================
 // Rate - PUBLIC
 
 /// Reed-Solomon encoder/decoder generator using specific rate.
@@ -596,7 +930,7 @@ where
 mod tests {
     extern crate alloc;
 
-    use super::{ReceivedShardBits, ReceivedShards};
+    use super::{ReceivedShardBits, ReceivedShardFlags, ReceivedShards};
     use alloc::vec;
     use alloc::vec::Vec;
     use core::ops::Range;
@@ -771,6 +1105,58 @@ mod tests {
         assert_eq!(flags.received_count(50..50), 0);
         assert_eq!(flags.received_count(50..10), 0);
         assert_eq!(flags.missing_in(50..10).count(), 0);
+    }
+
+    #[test]
+    fn shard_flags() {
+        for (original_count, recovery_count) in [(1usize, 1usize), (8, 4), (37, 19), (100, 130)] {
+            // The layouts used by high and low rate decoding. Base positions which are not
+            // multiples of 64 exercise the shifting in `shifted_word`.
+            for (original_base_pos, recovery_base_pos) in [
+                (recovery_count.next_power_of_two(), 0),
+                (0, original_count.next_power_of_two()),
+            ] {
+                let original: Vec<bool> = (0..original_count).map(|index| index % 5 != 1).collect();
+                let recovery: Vec<bool> = (0..recovery_count).map(|index| index % 3 == 0).collect();
+
+                let flags = ReceivedShardFlags {
+                    original: original.as_slice(),
+                    original_base_pos,
+                    original_count,
+                    recovery: recovery.as_slice(),
+                    recovery_base_pos,
+                    recovery_count,
+                };
+
+                let end = core::cmp::max(
+                    original_base_pos + original_count,
+                    recovery_base_pos + recovery_count,
+                ) + 130;
+
+                // `received_word` must agree with `received` bit by bit.
+                for word_index in 0..end.div_ceil(64) {
+                    let expected: u64 = (0..64)
+                        .map(|bit| u64::from(flags.received(word_index * 64 + bit)) << bit)
+                        .sum();
+                    assert_eq!(flags.received_word(word_index), expected);
+                }
+
+                // ... and so must the methods built on top of it.
+                for range in [0..end, 1..end - 1, 0..1, 64..65] {
+                    assert_eq!(
+                        flags.received_count(range.clone()),
+                        range.clone().filter(|index| flags.received(*index)).count()
+                    );
+                    assert_eq!(
+                        flags.missing_in(range.clone()).collect::<Vec<_>>(),
+                        range
+                            .clone()
+                            .filter(|index| !flags.received(*index))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

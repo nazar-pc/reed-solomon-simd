@@ -2,7 +2,11 @@ use core::marker::PhantomData;
 
 use crate::{
     engine::{self, Engine, ShardStorage, GF_MODULUS, GF_ORDER},
-    rate::{DecoderWork, EncoderWork, Rate, RateDecoder, RateEncoder, ReceivedShards},
+    rate::{
+        decode_in_place_begin, in_place_shard_stride, undo_in_place_last_chunk_encoding,
+        DecoderWork, EncoderWork, InPlaceWork, Rate, RateDecoder, RateEncoder, ReceivedShardFlags,
+        ReceivedShards,
+    },
     DecoderResult, EncoderResult, Error,
 };
 
@@ -26,6 +30,54 @@ impl<E: Engine> Rate<E> for LowRate<E> {
 }
 
 // ======================================================================
+// LowRateEncoder - IN-PLACE - PRIVATE
+
+/// Low rate encoding of an already prepared working buffer.
+///
+/// Shared by [`LowRateEncoder::encode`] and [`LowRateEncoder::encode_in_place`].
+fn encode_in_place<E: Engine, S: ShardStorage>(
+    engine: &E,
+    work: &mut S,
+    original_count: usize,
+    recovery_count: usize,
+) {
+    let chunk_size = original_count.next_power_of_two();
+
+    // ZEROPAD ORIGINAL
+
+    work.zero(original_count..chunk_size);
+
+    // IFFT - ORIGINAL
+
+    engine.ifft(work, 0, chunk_size, original_count, 0);
+
+    // COPY IFFT RESULT TO OTHER CHUNKS
+
+    let mut chunk_start = chunk_size;
+    while chunk_start < recovery_count {
+        // SAFETY: Shard-ranges `0 .. chunk_size` and
+        // `chunk_start .. chunk_start + chunk_size` are within bounds and don't overlap
+        unsafe { work.copy_within(0, chunk_start, chunk_size) };
+        chunk_start += chunk_size;
+    }
+
+    // FFT - FULL CHUNKS
+
+    let mut chunk_start = 0;
+    while chunk_start + chunk_size <= recovery_count {
+        engine::fft_skew_end(engine, work, chunk_start, chunk_size, chunk_size);
+        chunk_start += chunk_size;
+    }
+
+    // FFT - FINAL PARTIAL CHUNK
+
+    let last_count = recovery_count % chunk_size;
+    if last_count > 0 {
+        engine::fft_skew_end(engine, work, chunk_start, chunk_size, last_count);
+    }
+}
+
+// ======================================================================
 // LowRateEncoder - PUBLIC
 
 /// Reed-Solomon encoder using only low rate.
@@ -43,41 +95,8 @@ impl<E: Engine> RateEncoder<E> for LowRateEncoder<E> {
 
     fn encode(&mut self) -> Result<EncoderResult<'_>, Error> {
         let (mut work, original_count, recovery_count) = self.work.encode_begin()?;
-        let chunk_size = original_count.next_power_of_two();
-        let engine = &self.engine;
 
-        // ZEROPAD ORIGINAL
-
-        work.zero(original_count..chunk_size);
-
-        // IFFT - ORIGINAL
-
-        engine.ifft(&mut work, 0, chunk_size, original_count, 0);
-
-        // COPY IFFT RESULT TO OTHER CHUNKS
-
-        let mut chunk_start = chunk_size;
-        while chunk_start < recovery_count {
-            // SAFETY: Shard-ranges `0 .. chunk_size` and
-            // `chunk_start .. chunk_start + chunk_size` are within bounds and don't overlap
-            unsafe { work.copy_within(0, chunk_start, chunk_size) };
-            chunk_start += chunk_size;
-        }
-
-        // FFT - FULL CHUNKS
-
-        let mut chunk_start = 0;
-        while chunk_start + chunk_size <= recovery_count {
-            engine::fft_skew_end(engine, &mut work, chunk_start, chunk_size, chunk_size);
-            chunk_start += chunk_size;
-        }
-
-        // FFT - FINAL PARTIAL CHUNK
-
-        let last_count = recovery_count % chunk_size;
-        if last_count > 0 {
-            engine::fft_skew_end(engine, &mut work, chunk_start, chunk_size, last_count);
-        }
+        encode_in_place(&self.engine, &mut work, original_count, recovery_count);
 
         // UNDO LAST CHUNK ENCODING
 
@@ -115,6 +134,57 @@ impl<E: Engine> RateEncoder<E> for LowRateEncoder<E> {
 }
 
 // ======================================================================
+// LowRateEncoder - IN-PLACE - PUBLIC
+
+impl<E: Engine> LowRateEncoder<E> {
+    /// Size in bytes of the working buffer required by [`LowRateEncoder::encode_in_place`].
+    ///
+    /// This is the low rate counterpart of [`HighRateEncoder::in_place_work_bytes`], see its
+    /// documentation for details.
+    ///
+    /// [`HighRateEncoder::in_place_work_bytes`]: crate::rate::HighRateEncoder::in_place_work_bytes
+    #[must_use]
+    pub const fn in_place_work_bytes(
+        original_count: usize,
+        recovery_count: usize,
+        shard_bytes: usize,
+    ) -> usize {
+        Self::work_count(original_count, recovery_count) * in_place_shard_stride(shard_bytes)
+    }
+
+    /// Encodes in a caller-provided working buffer, without allocating anything.
+    ///
+    /// This is the low rate counterpart of [`HighRateEncoder::encode_in_place`], see its
+    /// documentation for details. The only difference is that the working buffer must be
+    /// [`LowRateEncoder::in_place_work_bytes`] long.
+    ///
+    /// [`HighRateEncoder::encode_in_place`]: crate::rate::HighRateEncoder::encode_in_place
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidWorkBufferSize`] if `work` is smaller than
+    /// [`LowRateEncoder::in_place_work_bytes`], otherwise same as [`RateEncoder::validate`].
+    pub fn encode_in_place<W: InPlaceWork + ?Sized>(
+        engine: &E,
+        original_count: usize,
+        recovery_count: usize,
+        shard_bytes: usize,
+        work: &mut W,
+    ) -> Result<(), Error> {
+        Self::validate(original_count, recovery_count, shard_bytes)?;
+
+        let work_count = Self::work_count(original_count, recovery_count);
+        let mut work = work.in_place_storage(work_count, shard_bytes)?;
+
+        encode_in_place(engine, &mut work, original_count, recovery_count);
+
+        undo_in_place_last_chunk_encoding(&mut work, shard_bytes, 0..recovery_count);
+
+        Ok(())
+    }
+}
+
+// ======================================================================
 // LowRateEncoder - PRIVATE
 
 impl<E: Engine> LowRateEncoder<E> {
@@ -134,12 +204,89 @@ impl<E: Engine> LowRateEncoder<E> {
         Ok(())
     }
 
-    fn work_count(original_count: usize, recovery_count: usize) -> usize {
-        debug_assert!(Self::supports(original_count, recovery_count));
+    /// Number of shards of working space needed.
+    ///
+    /// Only meaningful for supported `original_count` / `recovery_count` combinations, which
+    /// callers check with [`RateEncoder::validate`] first.
+    const fn work_count(original_count: usize, recovery_count: usize) -> usize {
+        recovery_count.next_multiple_of(original_count.next_power_of_two())
+    }
+}
 
-        let chunk_size = original_count.next_power_of_two();
+// ======================================================================
+// LowRateDecoder - IN-PLACE - PRIVATE
 
-        recovery_count.next_multiple_of(chunk_size)
+/// Low rate decoding of an already prepared working buffer.
+///
+/// Shared by [`LowRateDecoder::decode`] and [`LowRateDecoder::decode_in_place`].
+fn decode_in_place<E: Engine, R: ReceivedShards, S: ShardStorage>(
+    engine: &E,
+    work: &mut S,
+    original_count: usize,
+    recovery_count: usize,
+    received: &R,
+) {
+    let chunk_size = original_count.next_power_of_two();
+    let recovery_end = chunk_size + recovery_count;
+    let work_count = work.len();
+
+    // ERASURE LOCATIONS
+
+    let mut erasures = [0; GF_ORDER];
+
+    for index in received.missing_in(0..original_count) {
+        erasures[index] = 1;
+    }
+
+    for index in received.missing_in(chunk_size..recovery_end) {
+        erasures[index] = 1;
+    }
+
+    erasures[recovery_end..].fill(1);
+
+    // EVALUATE POLYNOMIAL
+
+    E::eval_poly(&mut erasures, GF_ORDER);
+
+    // MULTIPLY SHARDS
+
+    // work[               .. original_count] = original * erasures
+    // work[original_count .. chunk_size    ] = 0
+    // work[chunk_size     .. recovery_end  ] = recovery * erasures
+    // work[recovery_end   ..               ] = 0
+
+    for i in 0..original_count {
+        if received.received(i) {
+            engine.mul(&mut work[i], erasures[i]);
+        } else {
+            work[i].fill([0; 64]);
+        }
+    }
+
+    work.zero(original_count..chunk_size);
+
+    for i in chunk_size..recovery_end {
+        if received.received(i) {
+            engine.mul(&mut work[i], erasures[i]);
+        } else {
+            work[i].fill([0; 64]);
+        }
+    }
+
+    work.zero(recovery_end..);
+
+    // IFFT / FORMAL DERIVATIVE / FFT
+
+    engine.ifft(work, 0, work_count, recovery_end, 0);
+    engine::formal_derivative(work);
+    engine.fft(work, 0, work_count, recovery_end, 0);
+
+    // REVEAL ERASURES
+
+    for i in 0..original_count {
+        if !received.received(i) {
+            engine.mul(&mut work[i], GF_MODULUS - erasures[i]);
+        }
     }
 }
 
@@ -179,68 +326,13 @@ impl<E: Engine> RateDecoder<E> for LowRateDecoder<E> {
             return Ok(DecoderResult::new(&mut self.work));
         };
 
-        let chunk_size = original_count.next_power_of_two();
-        let recovery_end = chunk_size + recovery_count;
-        let work_count = work.len();
-
-        // ERASURE LOCATIONS
-
-        let mut erasures = [0; GF_ORDER];
-
-        for index in received.missing_in(0..original_count) {
-            erasures[index] = 1;
-        }
-
-        for index in received.missing_in(chunk_size..recovery_end) {
-            erasures[index] = 1;
-        }
-
-        erasures[recovery_end..].fill(1);
-
-        // EVALUATE POLYNOMIAL
-
-        E::eval_poly(&mut erasures, GF_ORDER);
-
-        // MULTIPLY SHARDS
-
-        // work[               .. original_count] = original * erasures
-        // work[original_count .. chunk_size    ] = 0
-        // work[chunk_size     .. original_end  ] = recovery * erasures
-        // work[recovery_end   ..               ] = 0
-
-        for i in 0..original_count {
-            if received.received(i) {
-                self.engine.mul(&mut work[i], erasures[i]);
-            } else {
-                work[i].fill([0; 64]);
-            }
-        }
-
-        work.zero(original_count..chunk_size);
-
-        for i in chunk_size..recovery_end {
-            if received.received(i) {
-                self.engine.mul(&mut work[i], erasures[i]);
-            } else {
-                work[i].fill([0; 64]);
-            }
-        }
-
-        work.zero(recovery_end..);
-
-        // IFFT / FORMAL DERIVATIVE / FFT
-
-        self.engine.ifft(&mut work, 0, work_count, recovery_end, 0);
-        engine::formal_derivative(&mut work);
-        self.engine.fft(&mut work, 0, work_count, recovery_end, 0);
-
-        // REVEAL ERASURES
-
-        for i in 0..original_count {
-            if !received.received(i) {
-                self.engine.mul(&mut work[i], GF_MODULUS - erasures[i]);
-            }
-        }
+        decode_in_place(
+            &self.engine,
+            &mut work,
+            original_count,
+            recovery_count,
+            &received,
+        );
 
         // UNDO LAST CHUNK ENCODING
 
@@ -278,6 +370,108 @@ impl<E: Engine> RateDecoder<E> for LowRateDecoder<E> {
 }
 
 // ======================================================================
+// LowRateDecoder - IN-PLACE - PUBLIC
+
+impl<E: Engine> LowRateDecoder<E> {
+    /// Size in bytes of the working buffer required by [`LowRateDecoder::decode_in_place`].
+    ///
+    /// This is the low rate counterpart of [`HighRateDecoder::in_place_work_bytes`], see its
+    /// documentation for details.
+    ///
+    /// [`HighRateDecoder::in_place_work_bytes`]: crate::rate::HighRateDecoder::in_place_work_bytes
+    #[must_use]
+    pub const fn in_place_work_bytes(
+        original_count: usize,
+        recovery_count: usize,
+        shard_bytes: usize,
+    ) -> usize {
+        Self::work_count(original_count, recovery_count) * in_place_shard_stride(shard_bytes)
+    }
+
+    /// Working buffer slot of original shard `index` for [`LowRateDecoder::decode_in_place`].
+    ///
+    /// Pass the returned slot to [`write_in_place_shard`] and [`read_in_place_shard`].
+    ///
+    /// [`write_in_place_shard`]: crate::rate::write_in_place_shard
+    /// [`read_in_place_shard`]: crate::rate::read_in_place_shard
+    #[must_use]
+    pub const fn in_place_original_slot(
+        _original_count: usize,
+        _recovery_count: usize,
+        index: usize,
+    ) -> usize {
+        index
+    }
+
+    /// Working buffer slot of recovery shard `index` for [`LowRateDecoder::decode_in_place`].
+    ///
+    /// Pass the returned slot to [`write_in_place_shard`].
+    ///
+    /// [`write_in_place_shard`]: crate::rate::write_in_place_shard
+    #[must_use]
+    pub const fn in_place_recovery_slot(
+        original_count: usize,
+        _recovery_count: usize,
+        index: usize,
+    ) -> usize {
+        original_count.next_power_of_two() + index
+    }
+
+    /// Decodes in a caller-provided working buffer, without allocating anything.
+    ///
+    /// This is the low rate counterpart of [`HighRateDecoder::decode_in_place`], see its
+    /// documentation for details. Note that the working buffer size and the slots of shards
+    /// differ between the rates.
+    ///
+    /// [`HighRateDecoder::decode_in_place`]: crate::rate::HighRateDecoder::decode_in_place
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotEnoughShards`] if fewer shards than `original_count` were received and
+    /// [`Error::InvalidWorkBufferSize`] if `work` is smaller than
+    /// [`LowRateDecoder::in_place_work_bytes`], otherwise same as [`RateDecoder::validate`].
+    pub fn decode_in_place<W: InPlaceWork + ?Sized>(
+        engine: &E,
+        original_count: usize,
+        recovery_count: usize,
+        original_received: impl ReceivedShards,
+        recovery_received: impl ReceivedShards,
+        shard_bytes: usize,
+        work: &mut W,
+    ) -> Result<(), Error> {
+        Self::validate(original_count, recovery_count, shard_bytes)?;
+
+        if !decode_in_place_begin(
+            original_count,
+            recovery_count,
+            &original_received,
+            &recovery_received,
+        )? {
+            // Nothing to do, original data is complete.
+            return Ok(());
+        }
+
+        let work_count = Self::work_count(original_count, recovery_count);
+        let mut work = work.in_place_storage(work_count, shard_bytes)?;
+
+        let received = ReceivedShardFlags {
+            original: original_received,
+            original_base_pos: 0,
+            original_count,
+            recovery: recovery_received,
+            recovery_base_pos: original_count.next_power_of_two(),
+            recovery_count,
+        };
+
+        decode_in_place(engine, &mut work, original_count, recovery_count, &received);
+
+        undo_in_place_last_chunk_encoding(&mut work, shard_bytes, 0..original_count);
+
+        Ok(())
+    }
+}
+
+// ======================================================================
 // LowRateDecoder - PRIVATE
 
 impl<E: Engine> LowRateDecoder<E> {
@@ -303,9 +497,11 @@ impl<E: Engine> LowRateDecoder<E> {
         Ok(())
     }
 
-    fn work_count(original_count: usize, recovery_count: usize) -> usize {
-        debug_assert!(Self::supports(original_count, recovery_count));
-
+    /// Number of shards of working space needed.
+    ///
+    /// Only meaningful for supported `original_count` / `recovery_count` combinations, which
+    /// callers check with [`RateDecoder::validate`] first.
+    const fn work_count(original_count: usize, recovery_count: usize) -> usize {
         (original_count.next_power_of_two() + recovery_count).next_power_of_two()
     }
 }

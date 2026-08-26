@@ -105,6 +105,19 @@ pub enum Error {
         shard_bytes: usize,
     },
 
+    /// Given working buffer is too small for in-place encoding or decoding.
+    ///
+    /// Use `in_place_work_bytes()` of the encoder/decoder in question to determine the required
+    /// size, for example [`HighRateEncoder::in_place_work_bytes`].
+    ///
+    /// [`HighRateEncoder::in_place_work_bytes`]: crate::rate::HighRateEncoder::in_place_work_bytes
+    InvalidWorkBufferSize {
+        /// Required size of the working buffer in bytes.
+        required: usize,
+        /// Size of the given working buffer in bytes.
+        got: usize,
+    },
+
     /// Decoder was given too few shards.
     ///
     /// Decoding requires as many shards as there were original shards
@@ -186,6 +199,13 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "invalid shard size: {shard_bytes} bytes (must non-zero and multiple of 2)"
+                )
+            }
+
+            Self::InvalidWorkBufferSize { required, got } => {
+                write!(
+                    f,
+                    "invalid working buffer size: {got} bytes given, {required} bytes required"
                 )
             }
 
