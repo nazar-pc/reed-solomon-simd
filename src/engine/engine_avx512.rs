@@ -1,9 +1,9 @@
-use std::iter::zip;
+use core::iter::zip;
 
 #[cfg(target_arch = "x86")]
-use std::arch::x86::*;
+use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+use core::arch::x86_64::*;
 
 use crate::engine::{
     tables::{self, Mul128, Multiply128lutT, Skew},
