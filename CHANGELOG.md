@@ -42,5 +42,6 @@
 ## Unreleased
 * `Avx512` engine for CPUs without GFNI support.
 - `Avx2Gfni` and `Avx512Gfni` engines, which evaluate a multiplication as a `GF(2)` matrix
-  product with `vgf2p8affineqb` instead of four `vpshufb` nibble table lookups. `DefaultEngine`
-  prefers `Avx2Gfni` when AVX2 and GFNI are available.
+  product with `vgf2p8affineqb` instead of four `vpshufb` nibble table lookups.
+- `DefaultEngine` picks between `Avx2Gfni` and `Avx512Gfni` by timing both `mul` kernels once
+  per process, since no CPUID bit distinguishes the CPUs where the 512 bit engine wins.

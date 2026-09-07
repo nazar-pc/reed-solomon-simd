@@ -59,6 +59,8 @@ mod engine_naive;
 mod engine_nosimd;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod calibrate;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod engine_avx2;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod engine_avx2gfni;
